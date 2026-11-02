@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""ccr: reopen recent Claude Code chats, each in its own Terminal window.
+
+Plain file scan of ~/.claude/projects; no model is involved.
+A chat is listed only if you typed a message in it inside the window; the time
+shown is your last typed message there. Notifications, agent messages, system
+reminders, tool results and bookkeeping lines never count.
+
+  ccr              chats active since 5 AM yesterday, newest first
+  ccr 12h | 3d     chats active in the last 12 hours / 3 days
+  ccr 2026-10-31   chats active that day (5 AM to 5 AM the next morning)
+  ccr -l ...       list only, open nothing
+  ccr -y ...       open every listed chat without asking
+  ccr -p 1,3 ...   open only these numbers from the list, without asking
+  ccr --force ...  skip the 30 second repeat guard
+
+Guards: at most 10 windows per run, whatever is selected; a second run
+within 30 seconds of a launch is refused; chats already running in some
+window are skipped.
+"""
+import datetime as dt
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+PROJECTS = os.path.join(HOME, ".claude", "projects")
+LIVE_DIR = os.path.join(HOME, ".claude", "sessions")
+STATE_DIR = os.path.join(HOME, ".claude", "ccr")
+STAMP = os.path.join(STATE_DIR, "last-launch")
+MAX_WINDOWS = 10
+COOLDOWN_S = 30
+DAY_START_HOUR = 5
+LAUNCH_GAP_S = 0.5
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+SKIP_PROJECT_SUBSTR = ("helper-sessions",)
+
+
+def die(msg, code=1):
+    print(f"ccr: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def parse_args(argv):
+    opts = {"list": False, "yes": False, "force": False, "pick": None, "window": None}
+    it = iter(argv)
+    for a in it:
+        if a in ("-l", "--list"):
+            opts["list"] = True
+        elif a in ("-y", "--yes"):
+            opts["yes"] = True
+        elif a == "--force":
+            opts["force"] = True
+        elif a in ("-p", "--pick"):
+            opts["pick"] = next(it, None) or die("-p needs numbers, e.g. -p 1,3")
+        elif a in ("-h", "--help"):
+            print(__doc__.strip())
+            sys.exit(0)
+        elif opts["window"] is None and not a.startswith("-"):
+            opts["window"] = a
+        else:
+            die(f"unknown argument {a!r} (ccr -h for help)")
+    return opts
+
+
+def window_bounds(token):
+    now = dt.datetime.now().astimezone()
+    if token is None:
+        today = now.date() if now.hour >= DAY_START_HOUR else now.date() - dt.timedelta(days=1)
+        start = dt.datetime.combine(today - dt.timedelta(days=1), dt.time(DAY_START_HOUR)).astimezone()
+        return start, now, f"since {start:%a %b %-d} {DAY_START_HOUR} AM"
+    m = re.fullmatch(r"(\d+)([hd])", token)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        delta = dt.timedelta(hours=n) if unit == "h" else dt.timedelta(days=n)
+        return now - delta, now, f"last {n}{unit}"
+    try:
+        day = dt.date.fromisoformat(token)
+    except ValueError:
+        die(f"window {token!r} not understood: use 12h, 3d or YYYY-MM-DD")
+    start = dt.datetime.combine(day, dt.time(DAY_START_HOUR)).astimezone()
+    end = dt.datetime.combine(day + dt.timedelta(days=1), dt.time(DAY_START_HOUR)).astimezone()
+    return start, end, f"{day:%a %b %-d} ({DAY_START_HOUR} AM to {DAY_START_HOUR} AM)"
+
+
+def utc_key(d):
+    return d.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _his_text(x):
+    """His own text from a prompt field (str or list of blocks); None for harness text."""
+    if isinstance(x, str):
+        s = x.strip()
+        if s.startswith("<bash-input>"):  # a ! command he typed
+            inner = s[len("<bash-input>"):].split("</bash-input>")[0].strip()
+            return "!" + inner if inner else None
+        return s if s and not s.startswith("<") else None
+    if isinstance(x, list):
+        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in x):
+            return None
+        for b in x:
+            if isinstance(b, dict) and b.get("type") == "text":
+                s = (b.get("text") or "").strip()
+                if s and not s.startswith("<"):
+                    return s
+    return None
+
+
+def his_input(o):
+    """(timestamp, text) if this line is something he typed, else None.
+    Counts: his prompts (user lines that are not meta, sidechain, compact
+    summary, tool result or harness text such as task notifications, agent
+    messages and system reminders), his ! commands, and prompts he typed while Claude was busy
+    (queue-operation enqueue lines and queued_command attachments carrying his
+    text). Nothing else dates an act: no system, summary or bookkeeping line."""
+    t = o.get("type")
+    if o.get("isSidechain") or o.get("isMeta") or o.get("isCompactSummary"):
+        return None
+    if t == "user":
+        text = _his_text((o.get("message") or {}).get("content"))
+    elif t == "queue-operation" and o.get("operation") == "enqueue":
+        text = _his_text(o.get("content"))
+    elif t == "attachment" and (o.get("attachment") or {}).get("type") == "queued_command":
+        text = _his_text(o["attachment"].get("prompt"))
+    else:
+        return None
+    ts = (o.get("timestamp") or "")[:19]
+    return (ts, text) if text and ts else None
+
+
+def scan_file(fp, lo, hi):
+    cwd = title = first_prompt = last_his = None
+    entrypoints = set()
+    with open(fp, "rb") as fh:
+        for raw in fh:
+            wanted = (b'"type":"user"' in raw or b'"queue-operation"' in raw
+                      or b'"queued_command"' in raw or b'"custom-title"' in raw)
+            if not wanted and cwd is not None:
+                continue
+            try:
+                o = json.loads(raw)
+            except ValueError:
+                continue
+            if cwd is None and o.get("cwd"):
+                cwd = o["cwd"]
+            t = o.get("type")
+            if t == "custom-title" and o.get("customTitle"):
+                title = o["customTitle"]
+            if t == "user" and o.get("entrypoint"):
+                entrypoints.add(o["entrypoint"])
+            hit = his_input(o)
+            if not hit:
+                continue
+            ts, text = hit
+            if first_prompt is None:
+                first_prompt = text
+            if lo <= ts < hi and (last_his is None or ts > last_his):
+                last_his = ts
+    if last_his is None or not cwd:
+        return None
+    if entrypoints and "cli" not in entrypoints:
+        return None
+    last = dt.datetime.strptime(last_his, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=dt.timezone.utc).astimezone()
+    return {"cwd": cwd, "title": title or first_prompt, "last": last}
+
+
+def find_chats(start, end):
+    lo, hi = utc_key(start), utc_key(end)
+    cutoff = start.timestamp()
+    chats, scanned = [], 0
+    for proj in os.listdir(PROJECTS):
+        if any(s in proj for s in SKIP_PROJECT_SUBSTR):
+            continue
+        pdir = os.path.join(PROJECTS, proj)
+        if not os.path.isdir(pdir):
+            continue
+        for f in os.listdir(pdir):
+            if not f.endswith(".jsonl") or not UUID_RE.fullmatch(f[:-6]):
+                continue
+            fp = os.path.join(pdir, f)
+            try:
+                if os.path.getmtime(fp) < cutoff:
+                    continue
+            except OSError:
+                continue
+            scanned += 1
+            info = scan_file(fp, lo, hi)
+            if info:
+                info["id"] = f[:-6]
+                chats.append(info)
+    chats.sort(key=lambda c: c["last"], reverse=True)
+    return chats, scanned
+
+
+def open_session_ids():
+    """Session ids running right now: live session records with a live claude pid,
+    plus any uuid on the command line of a running claude process."""
+    out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
+    procs = {}
+    for line in out.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit():
+            procs[int(parts[0])] = parts[1]
+    ids = set()
+    for pid, cmd in procs.items():
+        argv0 = cmd.split()[0] if cmd.split() else ""
+        if os.path.basename(argv0) == "claude":
+            ids.update(UUID_RE.findall(cmd))
+    try:
+        names = os.listdir(LIVE_DIR)
+    except OSError:
+        names = []
+    for n in names:
+        if not n.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(LIVE_DIR, n)) as fh:
+                d = json.load(fh)
+            pid = int(d.get("pid", 0))
+        except (OSError, ValueError, TypeError):
+            continue
+        cmd = procs.get(pid, "")
+        if cmd and os.path.basename(cmd.split()[0]) == "claude" and d.get("sessionId"):
+            ids.add(d["sessionId"])
+    return ids
+
+
+def short_path(p):
+    return "~" + p[len(HOME):] if p == HOME or p.startswith(HOME + "/") else p
+
+
+def one_line(s, n):
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[: n - 3] + "..."
+
+
+def parse_pick(text, n):
+    picked = []
+    for tok in re.split(r"[\s,]+", text.strip()):
+        if not tok:
+            continue
+        if not tok.isdigit() or not 1 <= int(tok) <= n:
+            die(f"{tok!r} is not a number from the list (1 to {n})")
+        if int(tok) not in picked:
+            picked.append(int(tok))
+    return picked
+
+
+def launch(slot, chat, claude_bin):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    path = os.path.join(STATE_DIR, f"launch-{slot:02d}.command")
+    header = f"ccr: {one_line(chat['title'], 60)}"
+    body = (
+        "#!/bin/zsh\n"
+        f"echo {shlex.quote(header)}\n"
+        f"cd -- {shlex.quote(chat['cwd'])} || exit 1\n"
+        f"exec {shlex.quote(claude_bin)} --resume {shlex.quote(chat['id'])}\n"
+    )
+    with open(path, "w") as fh:
+        fh.write(body)
+    os.chmod(path, 0o755)
+    subprocess.run(["open", "-a", "Terminal", path], check=True)
+
+
+def main():
+    opts = parse_args(sys.argv[1:])
+    start, end, label = window_bounds(opts["window"])
+    t0 = time.time()
+    chats, scanned = find_chats(start, end)
+    live = open_session_ids()
+    secs = time.time() - t0
+
+    todo = [c for c in chats if c["id"] not in live]
+    already = [c for c in chats if c["id"] in live]
+
+    print(f"Chats you typed in {label}: {len(chats)} ({len(already)} already open)  [{scanned} files scanned in {secs:.2f}s]")
+    print(f"{'':4s}  {'your last message':20s}  {'folder':22s}  chat")
+    for i, c in enumerate(todo, 1):
+        print(f"{i:3d}  {c['last']:%a %b %d %H:%M %Z}  {one_line(short_path(c['cwd']), 22):22s}  {one_line(c['title'], 70)}")
+    for c in already:
+        print(f"open  {c['last']:%a %b %d %H:%M %Z}  {one_line(short_path(c['cwd']), 22):22s}  {one_line(c['title'], 70)}")
+    if not todo:
+        print("Nothing to open.")
+        return
+    if opts["list"]:
+        return
+
+    if not opts["force"] and os.path.exists(STAMP):
+        age = time.time() - os.path.getmtime(STAMP)
+        if age < COOLDOWN_S:
+            die(f"last launch was {age:.0f}s ago; wait {COOLDOWN_S - age:.0f}s or use --force")
+
+    if opts["pick"]:
+        picked = parse_pick(opts["pick"], len(todo))
+    elif opts["yes"]:
+        picked = list(range(1, len(todo) + 1))
+    else:
+        if not sys.stdin.isatty():
+            print("No keyboard here: rerun with -y (all) or -p 1,3 (some).")
+            return
+        default = min(len(todo), MAX_WINDOWS)
+        ans = input(f"Open which? Enter = {'all ' + str(default) if default == len(todo) else 'newest ' + str(default)}, numbers like 1 3, q = quit: ")
+        if ans.strip().lower() in ("q", "quit", "n", "no"):
+            return
+        picked = parse_pick(ans, len(todo)) if ans.strip() else list(range(1, len(todo) + 1))
+
+    if len(picked) > MAX_WINDOWS:
+        print(f"Limit is {MAX_WINDOWS} windows per run: opening the first {MAX_WINDOWS} of {len(picked)}.")
+        picked = picked[:MAX_WINDOWS]
+
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(STAMP, "w") as fh:
+        fh.write(dt.datetime.now().astimezone().isoformat() + "\n")
+
+    claude_bin = shutil.which("claude") or os.path.join(HOME, ".local", "bin", "claude")
+    opened = 0
+    for slot, k in enumerate(picked, 1):
+        c = todo[k - 1]
+        if not os.path.isdir(c["cwd"]):
+            print(f"  skip {k}: folder gone {c['cwd']}")
+            continue
+        launch(slot, c, claude_bin)
+        opened += 1
+        print(f"  opened {k}: {one_line(c['title'], 60)}")
+        time.sleep(LAUNCH_GAP_S)
+    print(f"Opened {opened} window(s).")
+
+
+if __name__ == "__main__":
+    main()
